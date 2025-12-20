@@ -68,6 +68,7 @@ pub enum SpecialExport {
     BuiltinsFrozenset,
     BuiltinsFloat,
     Deprecated,
+    SqlAlchemyMappedColumn,
     Final,
     TypingMapping,
     TypeForm,
@@ -130,6 +131,7 @@ impl SpecialExport {
             "frozenset" => Some(Self::BuiltinsFrozenset),
             "float" => Some(Self::BuiltinsFloat),
             "deprecated" => Some(Self::Deprecated),
+            "mapped_column" => Some(Self::SqlAlchemyMappedColumn),
             "Final" => Some(Self::Final),
             "Mapping" => Some(Self::TypingMapping),
             "TypeForm" => Some(Self::TypeForm),
@@ -204,6 +206,12 @@ impl SpecialExport {
                 "typing" | "typing_extensions" | "collections.abc"
             ),
             Self::Deprecated => matches!(m.as_str(), "warnings" | "typing_extensions"),
+            Self::SqlAlchemyMappedColumn => {
+                matches!(
+                    m.as_str(),
+                    "sqlalchemy.orm" | "sqlalchemy.orm._orm_constructors"
+                )
+            }
         }
     }
 
