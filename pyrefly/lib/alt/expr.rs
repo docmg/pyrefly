@@ -377,10 +377,75 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                     Some(HintRef::new(hint, Some(hint_errors))),
                     errors,
                 );
-                self.check_and_return_type_info(got, hint, x.range(), hint_errors, tcc)
+                let range = self
+                    .dict_literal_error_range(x, hint)
+                    .unwrap_or_else(|| x.range());
+                self.check_and_return_type_info(got, hint, range, hint_errors, tcc)
             }
             _ => self.expr_infer_type_info_with_hint(x, None, errors),
         }
+    }
+
+    fn dict_literal_error_range(&self, x: &Expr, hint: &Type) -> Option<TextRange> {
+        let Expr::Dict(dict) = x else {
+            return None;
+        };
+        let (key_hint, value_hint) = self.decompose_dict(hint);
+        if key_hint.is_none() && value_hint.is_none() {
+            return None;
+        }
+        let items = Ast::flatten_dict_items(&dict.items);
+        let swallower = self.error_swallower();
+        for item in items {
+            match &item.key {
+                Some(key) => {
+                    if let Some(key_hint) = &key_hint {
+                        let key_ty = self.expr_infer_with_hint_promote(
+                            key,
+                            HintRef::with_ty_opt(None, Some(key_hint)),
+                            &swallower,
+                        );
+                        if !key_ty.is_error() && !self.is_subset_eq(&key_ty, key_hint) {
+                            return Some(key.range());
+                        }
+                    }
+                    if let Some(value_hint) = &value_hint {
+                        let value_ty = self.expr_infer_with_hint_promote(
+                            &item.value,
+                            HintRef::with_ty_opt(None, Some(value_hint)),
+                            &swallower,
+                        );
+                        if !value_ty.is_error() && !self.is_subset_eq(&value_ty, value_hint) {
+                            return Some(item.value.range());
+                        }
+                    }
+                }
+                None => {
+                    let unpacked_ty = self.expr_infer(&item.value, &swallower);
+                    if unpacked_ty.is_error() {
+                        continue;
+                    }
+                    match self.unwrap_mapping(&unpacked_ty) {
+                        Some((key_ty, value_ty)) => {
+                            if let Some(key_hint) = &key_hint {
+                                if !self.is_subset_eq(&key_ty, key_hint) {
+                                    return Some(item.value.range());
+                                }
+                            }
+                            if let Some(value_hint) = &value_hint {
+                                if !self.is_subset_eq(&value_ty, value_hint) {
+                                    return Some(item.value.range());
+                                }
+                            }
+                        }
+                        None => {
+                            return Some(item.value.range());
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn expr_type_info_with_separate_check_errors_with_call_context(
@@ -397,10 +462,13 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                     Some(HintRef::new(hint, Some(hint_errors))),
                     errors,
                 );
+                let range = self
+                    .dict_literal_error_range(x, hint)
+                    .unwrap_or_else(|| x.range());
                 self.check_and_return_type_info_with_call_context(
                     got,
                     hint,
-                    x.range(),
+                    range,
                     hint_errors,
                     tcc,
                     call_context,
