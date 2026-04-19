@@ -13,7 +13,6 @@
 
 use pyrefly_types::callable::FuncMetadata;
 use pyrefly_types::type_alias::TypeAliasData;
-use pyrefly_types::types::Union;
 use pyrefly_util::visit::Visit;
 use pyrefly_util::visit::VisitMut;
 use ruff_python_ast::Expr;
@@ -38,7 +37,6 @@ use crate::types::callable::FunctionKind;
 use crate::types::callable::unexpected_keyword;
 use crate::types::class::Class;
 use crate::types::class::ClassType;
-use crate::types::special_form::SpecialForm;
 use crate::types::tuple::Tuple;
 use crate::types::types::Type;
 
@@ -308,6 +306,13 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
             hint,
             errors,
         );
+        if hint.is_some_and(|hint| {
+            hint.types()
+                .iter()
+                .any(|ty| self.is_sqlalchemy_mapped_hint(ty))
+        }) {
+            return ret;
+        }
         let Some(mut python_type) = self.sqlalchemy_mapped_column_python_type(call) else {
             return ret;
         };
@@ -440,6 +445,10 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
             }
         });
         ty
+    }
+
+    fn is_sqlalchemy_mapped_hint(&self, ty: &Type) -> bool {
+        matches!(ty, Type::ClassType(cls) if cls.has_qname("sqlalchemy.orm.base", "Mapped"))
     }
 
     fn sqlalchemy_mapped_descriptor_type(&self, class_type: &ClassType) -> Option<ClassType> {
