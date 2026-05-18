@@ -27,6 +27,7 @@ use pyrefly_util::display::DisplayWithCtx;
 use pyrefly_util::prelude::SliceExt;
 use pyrefly_util::prelude::VecExt;
 use ruff_python_ast::Expr;
+use ruff_python_ast::Identifier;
 use ruff_python_ast::name::Name;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
@@ -37,7 +38,11 @@ use starlark_map::small_set::SmallSet;
 
 use crate::alt::answers::LookupAnswer;
 use crate::alt::answers_solver::AnswersSolver;
+use crate::alt::call::CallStyle;
+use crate::alt::callable::CallArg;
+use crate::alt::callable::CallKeyword;
 use crate::alt::class::django::is_django_choices_subclass;
+use crate::alt::expr::TypeOrExpr;
 use crate::alt::solve::TypeFormContext;
 use crate::alt::types::abstract_class::AbstractClassMembers;
 use crate::alt::types::class_metadata::ClassMetadata;
@@ -123,7 +128,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         &self,
         cls: &Class,
         bases: &[BaseClass],
-        keywords: &[(Name, Expr)],
+        keywords: &[(Identifier, Expr)],
         decorators: &[Idx<KeyDecorator>],
         is_new_type: bool,
         pydantic_config_dict: &PydanticConfigDict,
@@ -162,11 +167,12 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         let bases_with_metadata = self.bases_with_metadata(parsed_results, is_new_type, errors);
 
         // Compute class keywords, including the metaclass.
-        let (metaclasses, keywords): (Vec<_>, Vec<(_, _)>) =
-            keywords.iter().partition_map(|(n, x)| match n.as_str() {
+        let (metaclasses, keyword_annotations): (Vec<_>, Vec<(_, _)>) =
+            keywords.iter().partition_map(|(n, x)| match n.id.as_str() {
                 "metaclass" => Either::Left(x),
                 _ => Either::Right((n.clone(), self.expr_class_keyword(x, errors))),
             });
+        let keyword_annotations = keyword_annotations.into_map(|(name, annot)| (name.id, annot));
 
         let base_metaclasses = bases_with_metadata
             .iter()
@@ -227,6 +233,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
             }
         }
         let metaclass = calculated_metaclass.get();
+        self.check_init_subclass_keywords(cls, &bases_with_metadata, keywords, errors);
 
         let mut directly_inherits_model = false;
         let mut inherited_django_metadata: Option<&DjangoModelMetadata> = None;
@@ -313,7 +320,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         let pydantic_config = self.pydantic_config(
             &bases_with_metadata,
             pydantic_config_dict,
-            &keywords,
+            &keyword_annotations,
             &decorators,
             errors,
             cls.range(),
@@ -332,8 +339,13 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                 format!("`{}` is not a typed dictionary. Typed dictionary definitions may only extend other typed dictionaries.", bad.0.name()),
             );
         }
-        let typed_dict_metadata =
-            self.typed_dict_metadata(cls, &bases_with_metadata, &keywords, is_typed_dict, errors);
+        let typed_dict_metadata = self.typed_dict_metadata(
+            cls,
+            &bases_with_metadata,
+            &keyword_annotations,
+            is_typed_dict,
+            errors,
+        );
         if metaclass.is_some() && is_typed_dict {
             self.error(
                 errors,
@@ -385,7 +397,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
             dataclass_defaults_from_base_class.clone(),
         );
         let dataclass_from_dataclass_transform = self.dataclass_from_dataclass_transform(
-            &keywords,
+            &keyword_annotations,
             &decorators,
             dataclass_defaults_from_base_class,
             pydantic_config.as_ref(),
@@ -464,7 +476,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         };
 
         // Get types of class keywords.
-        let keywords = keywords.into_map(|(name, annot)| {
+        let keywords = keyword_annotations.into_map(|(name, annot)| {
             (
                 name,
                 annot.ty.unwrap_or_else(|| self.heap.mk_any_implicit()),
@@ -508,6 +520,57 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
             is_metaclass,
             slots_info,
         )
+    }
+
+    fn check_init_subclass_keywords(
+        &self,
+        cls: &Class,
+        bases_with_metadata: &[(Class, Arc<ClassMetadata>)],
+        keywords: &[(Identifier, Expr)],
+        errors: &ErrorCollector,
+    ) {
+        let keywords = keywords
+            .iter()
+            .filter(|(name, _)| name.id != "metaclass")
+            .collect::<Vec<_>>();
+        if keywords.is_empty() {
+            return;
+        }
+        let Some((base, _)) = bases_with_metadata.first() else {
+            return;
+        };
+        let base = self.promote_nontypeddict_silently_to_classtype(base);
+        let Some(init_subclass) = self.get_dunder_init_subclass(&base) else {
+            return;
+        };
+        let cls_ty = self
+            .heap
+            .mk_type_of(self.heap.mk_class_type(self.as_class_type_unchecked(cls)));
+        let args = [CallArg::ty(&cls_ty, cls.range())];
+        let keywords = keywords
+            .into_iter()
+            .map(|(name, value)| CallKeyword {
+                range: name.range(),
+                arg: Some(name),
+                value: TypeOrExpr::Expr(value),
+            })
+            .collect::<Vec<_>>();
+        self.call_infer(
+            self.as_call_target_or_error(
+                init_subclass,
+                CallStyle::Method(&dunder::INIT_SUBCLASS),
+                cls.range(),
+                errors,
+                None,
+            ),
+            &args,
+            &keywords,
+            cls.range(),
+            errors,
+            None,
+            None,
+            None,
+        );
     }
 
     fn extract_slots_info(&self, cls: &Class) -> Option<SlotsInfo> {

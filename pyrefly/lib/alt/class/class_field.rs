@@ -4135,6 +4135,18 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         self.get_dunder_init_helper(&Instance::of_class(cls), get_object_init)
     }
 
+    /// Get the class's `__init_subclass__` method, excluding `object.__init_subclass__`.
+    pub fn get_dunder_init_subclass(&self, cls: &ClassType) -> Option<Type> {
+        let init_subclass_member =
+            self.get_class_member_with_defining_class(cls.class_object(), &dunder::INIT_SUBCLASS)?;
+        if init_subclass_member.is_defined_on("builtins", "object") {
+            None
+        } else {
+            Arc::unwrap_or_clone(init_subclass_member.value)
+                .as_raw_special_method_type(self.heap, &Instance::of_class(cls))
+        }
+    }
+
     pub fn get_typed_dict_dunder_init(&self, td: &TypedDictInner) -> Type {
         // We synthesize `__init__`, so the lookup will never entirely fail.
         //
