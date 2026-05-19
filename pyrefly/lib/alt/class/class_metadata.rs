@@ -69,6 +69,7 @@ use crate::binding::binding::Key;
 use crate::binding::binding::KeyClassField;
 use crate::binding::binding::KeyDecorator;
 use crate::binding::django::DjangoFieldInfo;
+use crate::binding::pydantic::EXTRA;
 use crate::binding::pydantic::PydanticConfigDict;
 use crate::binding::pydantic::VALIDATION_ALIAS;
 use crate::config::error_kind::ErrorKind;
@@ -529,9 +530,13 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         keywords: &[(Identifier, Expr)],
         errors: &ErrorCollector,
     ) {
+        let is_pydantic_model = bases_with_metadata.iter().any(|(base, metadata)| {
+            base.has_toplevel_qname(ModuleName::pydantic().as_str(), "BaseModel")
+                || metadata.is_pydantic_model()
+        });
         let keywords = keywords
             .iter()
-            .filter(|(name, _)| name.id != "metaclass")
+            .filter(|(name, _)| name.id != "metaclass" && !(is_pydantic_model && name.id == EXTRA))
             .collect::<Vec<_>>();
         if keywords.is_empty() {
             return;
