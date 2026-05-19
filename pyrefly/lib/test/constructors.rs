@@ -201,6 +201,18 @@ class Qux(Foo): ...  # E: Missing argument `asdf`
 );
 
 testcase!(
+    test_init_subclass_skips_custom_metaclass_keywords,
+    r#"
+class Meta(type):
+    def __new__(cls, name, bases, namespace, abstract: bool = False):
+        return super().__new__(cls, name, bases, namespace)
+
+class Base(metaclass=Meta): ...
+class Child(Base, abstract=True): ...
+    "#,
+);
+
+testcase!(
     test_metaclass_invalid_generic_legacy_typevar,
     r#"
 from typing import Any, Generic, TypeVar, assert_type

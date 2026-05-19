@@ -39,7 +39,6 @@ use starlark_map::small_set::SmallSet;
 use crate::alt::answers::LookupAnswer;
 use crate::alt::answers_solver::AnswersSolver;
 use crate::alt::call::CallStyle;
-use crate::alt::callable::CallArg;
 use crate::alt::callable::CallKeyword;
 use crate::alt::class::django::is_django_choices_subclass;
 use crate::alt::expr::TypeOrExpr;
@@ -234,7 +233,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
             }
         }
         let metaclass = calculated_metaclass.get();
-        self.check_init_subclass_keywords(cls, &bases_with_metadata, keywords, errors);
+        self.check_init_subclass_keywords(cls, &bases_with_metadata, metaclass, keywords, errors);
 
         let mut directly_inherits_model = false;
         let mut inherited_django_metadata: Option<&DjangoModelMetadata> = None;
@@ -527,6 +526,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         &self,
         cls: &Class,
         bases_with_metadata: &[(Class, Arc<ClassMetadata>)],
+        metaclass: Option<&ClassType>,
         keywords: &[(Identifier, Expr)],
         errors: &ErrorCollector,
     ) {
@@ -538,17 +538,19 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
             .iter()
             .filter(|(name, _)| name.id != "metaclass" && !(is_pydantic_model && name.id == EXTRA))
             .collect::<Vec<_>>();
+        if !keywords.is_empty() && metaclass.is_some() {
+            return;
+        }
         let Some((base, _)) = bases_with_metadata.first() else {
             return;
         };
+        let include_init_subclass_ancestors = !keywords.is_empty();
         let base = self.promote_nontypeddict_silently_to_classtype(base);
-        let Some(init_subclass) = self.get_dunder_init_subclass(&base) else {
+        let Some(init_subclass) =
+            self.get_dunder_init_subclass(&base, include_init_subclass_ancestors)
+        else {
             return;
         };
-        let cls_ty = self
-            .heap
-            .mk_type_of(self.heap.mk_class_type(self.as_class_type_unchecked(cls)));
-        let args = [CallArg::ty(&cls_ty, cls.range())];
         let keywords = keywords
             .into_iter()
             .map(|(name, value)| CallKeyword {
@@ -565,7 +567,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                 errors,
                 None,
             ),
-            &args,
+            &[],
             &keywords,
             cls.range(),
             errors,
