@@ -4144,9 +4144,11 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         if cls.class_object().is_builtin("object") {
             return None;
         }
-        let init_subclass_member = if let Some(field) =
-            self.get_field_from_current_class_only(cls.class_object(), &dunder::INIT_SUBCLASS)
-        {
+        let init_subclass_member = if let Some(field) = self
+            .get_non_synthesized_field_from_current_class_only(
+                cls.class_object(),
+                &dunder::INIT_SUBCLASS,
+            ) {
             WithDefiningClass {
                 value: field,
                 defining_class: cls.class_object().dupe(),
@@ -4159,7 +4161,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                 cls.class_object(),
                 mro.ancestors_no_object().iter(),
                 &dunder::INIT_SUBCLASS,
-                &|cls, name| self.get_field_from_current_class_only(cls, name),
+                &|cls, name| self.get_non_synthesized_field_from_current_class_only(cls, name),
             )?
         };
         if init_subclass_member.value.is_init_var() {
