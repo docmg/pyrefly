@@ -196,7 +196,7 @@ class Foo:
 
 class Bar(Foo, asdf=1): ...
 class Baz(Foo, asdf=""): ...  # E: Argument `Literal['']` is not assignable to parameter `asdf` with type `int`
-class Qux(Foo): ...
+class Qux(Foo): ...  # E: Missing argument `asdf`
     "#,
 );
 
