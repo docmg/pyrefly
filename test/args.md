@@ -35,21 +35,7 @@ $ mkdir $TMPDIR/site_package_path && \
 $ mkdir $TMPDIR/site_package_missing_source && \
 > mkdir $TMPDIR/site_package_missing_source/pkg-stubs && \
 > echo "class X: ..." > $TMPDIR/site_package_missing_source/pkg-stubs/__init__.py && \
-> echo "import pkg" > $TMPDIR/foo.py && \
-> $PYREFLY check $TMPDIR/foo.py --ignore-missing-source=false --site-package-path $TMPDIR/site_package_missing_source --output-format=min-text
-ERROR * Found stubs for `pkg`, but no source* (glob)
-[1]
-```
-
-```scrut {output_stream.stdout}
-$ echo "from pkg import X" > $TMPDIR/foo.py && \
-> $PYREFLY check $TMPDIR/foo.py --ignore-missing-source=false --site-package-path $TMPDIR/site_package_missing_source --output-format=min-text
-ERROR * Found stubs for `pkg`, but no source* (glob)
-[1]
-```
-
-```scrut {output_stream.stdout}
-$ echo "from pkg import X" > $TMPDIR/foo.py && \
+> echo "from pkg import X" > $TMPDIR/foo.py && \
 > $PYREFLY check $TMPDIR/foo.py --error=missing-source --site-package-path $TMPDIR/site_package_missing_source --output-format=min-text
 ERROR * Found stubs for `pkg`, but no source* (glob)
 [1]
@@ -61,7 +47,7 @@ ERROR * Found stubs for `pkg`, but no source* (glob)
 $ mkdir $TMPDIR/error_missing_source && \
 > echo -e '[errors]\nmissing-source="error"' > $TMPDIR/error_missing_source/pyrefly.toml && \
 > echo "from pkg import X" > $TMPDIR/error_missing_source/foo.py && \
-> $PYREFLY check $TMPDIR/error_missing_source/foo.py --ignore-missing-source --site-package-path $TMPDIR/site_package_missing_source --output-format=min-text
+> $PYREFLY check $TMPDIR/error_missing_source/foo.py --ignore=missing-source --site-package-path $TMPDIR/site_package_missing_source --output-format=min-text
 [0]
 ```
 
@@ -81,14 +67,65 @@ ERROR * [missing-source] (glob)
 -->
 
 ```scrut {output_stream.stdout}
-$ mkdir $TMPDIR/site_package_missing_stubs && \
+$ touch $TMPDIR/pyrefly.toml && \
+> mkdir $TMPDIR/site_package_missing_stubs && \
 > mkdir $TMPDIR/site_package_missing_stubs/django && \
 > touch $TMPDIR/site_package_missing_stubs/django/__init__.py && \
 > mkdir $TMPDIR/site_package_missing_stubs/django/forms && \
 > touch $TMPDIR/site_package_missing_stubs/django/forms/__init__.py && \
 > echo "from django import forms; from typing import reveal_type; reveal_type(forms)" > $TMPDIR/foo.py && \
 > $PYREFLY check $TMPDIR/foo.py --error untyped-import --ignore missing-module-attribute --site-package-path $TMPDIR/site_package_missing_stubs --output-format=min-text
-ERROR * Missing type stubs for `django` * (glob)
+ERROR * Cannot find type stubs for module `django` * (glob)
  INFO * revealed type: Module[django.forms] * (glob)
+[1]
+```
+
+## The `--preset` flag sets the preset and suppresses the upsell
+
+```scrut {output_stream: stderr}
+$ PRESET_DIR=$(mktemp -d -p /tmp preset.XXXXXX) && \
+> echo "x = unknown_name" > $PRESET_DIR/foo.py && \
+> $PYREFLY check $PRESET_DIR/foo.py --preset off; rm -rf $PRESET_DIR
+ INFO 0 errors
+[0]
+```
+
+## Error mappings in the config file override `--preset`
+
+```scrut {output_stream: stdout}
+$ echo -e '[errors]\nimplicit-any = "ignore"' > $TMPDIR/pyrefly.toml && \
+> echo "x = []" > $TMPDIR/foo.py && \
+> $PYREFLY check $TMPDIR/foo.py --preset strict --output-format=min-text
+[0]
+```
+
+## Scalar fields in the config file override `--preset`
+
+```scrut {output_stream: stdout}
+$ echo "check-unannotated-defs = true" > $TMPDIR/pyrefly.toml && \
+> echo -e "def f():\n    x = unknown_name" > $TMPDIR/foo.py && \
+> $PYREFLY check $TMPDIR/foo.py --preset basic --output-format=min-text
+ERROR * [unknown-name] (glob)
+[1]
+```
+
+## `--preset` in a directory with mypy.ini should not inherit migrated values
+
+```scrut {output_stream: stdout}
+$ MYPY_DIR=$(mktemp -d -p /tmp mypy.XXXXXX) && \
+> echo -e "[mypy]\ncheck_untyped_defs = False" > $MYPY_DIR/mypy.ini && \
+> echo -e "def f():\n    x: int = 'hello'" > $MYPY_DIR/foo.py && \
+> $PYREFLY check $MYPY_DIR/foo.py --preset strict --output-format=min-text; rc=$?; rm -rf $MYPY_DIR; exit $rc
+ERROR * [bad-assignment] (glob)
+[1]
+```
+
+## CLI error flags override `--preset`
+
+```scrut {output_stream: stdout}
+$ touch $TMPDIR/pyrefly.toml && \
+> echo "x: int = 'hello'" > $TMPDIR/foo.py && \
+> $PYREFLY check $TMPDIR/foo.py --preset off --error bad-assignment --output-format=min-text
+ERROR * [bad-assignment] (glob)
 [1]
 ```
