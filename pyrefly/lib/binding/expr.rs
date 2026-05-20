@@ -1336,7 +1336,7 @@ impl<'a> BindingsBuilder<'a> {
     }
 
     fn attrs_default_decorator_field(&self, expr: &Expr) -> Option<Name> {
-        if self.scopes.enclosing_class_and_metadata_keys().is_none() {
+        if self.scopes.enclosing_class_object_idx().is_none() {
             return None;
         }
         let Expr::Attribute(attr) = expr else {
