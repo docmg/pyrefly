@@ -22,7 +22,6 @@ use ruff_python_ast::ExprTuple;
 use ruff_python_ast::Identifier;
 use ruff_python_ast::Stmt;
 use ruff_python_ast::StmtAssign;
-use ruff_python_ast::StmtExpr;
 use ruff_python_ast::StmtImportFrom;
 use ruff_python_ast::StmtReturn;
 use ruff_python_ast::name::Name;
@@ -202,7 +201,7 @@ impl<'a> BindingsBuilder<'a> {
         for target in targets.iter_mut() {
             let range = target.range();
             self.bind_target_no_expr(target, &|ann| {
-                Binding::MultiTargetAssign(ann, rhs_idx, range)
+                Binding::MultiTargetAssign(ann, rhs_idx, range, None)
             });
         }
     }
@@ -709,6 +708,17 @@ impl<'a> BindingsBuilder<'a> {
             }
             Stmt::AnnAssign(mut x) => match *x.target {
                 Expr::Name(name) => {
+                    if Ast::is_synthesized_empty_name(&name) {
+                        self.ensure_type(&mut x.annotation, &mut None);
+                        if let Some(value) = x.value {
+                            self.bind_single_name_assign(
+                                &Ast::expr_name_identifier(name),
+                                value,
+                                None,
+                            );
+                        }
+                        return;
+                    }
                     // Handle annotated legacy TypeVar creation T: TypeVar = TypeVar("T")
                     if let Some(ref mut value) = x.value
                         && let Expr::Call(call) = value.as_mut()
@@ -806,6 +816,7 @@ impl<'a> BindingsBuilder<'a> {
                     }
                 }
                 Expr::Attribute(attr) => {
+                    let mut attr = attr;
                     let attr_name = attr.attr.id.clone();
                     self.ensure_type(&mut x.annotation, &mut None);
                     let ann_key = self.insert_binding(
@@ -822,7 +833,15 @@ impl<'a> BindingsBuilder<'a> {
                                 ExprOrBinding::Expr(v.clone())
                             })
                         }
-                        _ => ExprOrBinding::Binding(Binding::Any(AnyStyle::Implicit)),
+                        _ => {
+                            self.ensure_expr(
+                                &mut attr.value,
+                                &mut Usage::StaticTypeInformation {
+                                    is_annotation: false,
+                                },
+                            );
+                            ExprOrBinding::Binding(Binding::Any(AnyStyle::Implicit))
+                        }
                     };
                     if !self
                         .scopes
@@ -967,7 +986,10 @@ impl<'a> BindingsBuilder<'a> {
                 }
             }
             Stmt::For(mut x) => {
-                if x.is_async && !self.scopes.is_in_async_def() {
+                if x.is_async
+                    && !self.scopes.is_in_async_def()
+                    && !self.module_info.path().is_notebook()
+                {
                     self.error(
                         x.range(),
                         ErrorKind::InvalidSyntax,
@@ -1148,7 +1170,10 @@ impl<'a> BindingsBuilder<'a> {
                 }
             }
             Stmt::With(x) => {
-                if x.is_async && !self.scopes.is_in_async_def() {
+                if x.is_async
+                    && !self.scopes.is_in_async_def()
+                    && !self.module_info.path().is_notebook()
+                {
                     self.error(
                         x.range(),
                         ErrorKind::InvalidSyntax,
@@ -1355,23 +1380,20 @@ impl<'a> BindingsBuilder<'a> {
                     self.declare_mutable_capture(&name, MutableCaptureKind::Nonlocal);
                 }
             }
-            Stmt::Expr(StmtExpr {
-                range: expr_range,
-                value:
-                    box Expr::Call(ExprCall {
-                        range: call_range,
-                        func: box Expr::Name(name),
-                        arguments:
-                            Arguments {
-                                range: _,
-                                keywords: _,
-                                args,
-                                ..
-                            },
-                        ..
-                    }),
-                ..
-            }) if name.id.as_str() == "prod_assert" && (args.len() == 1 || args.len() == 2) => {
+            Stmt::Expr(stmt_expr)
+                if matches!(&*stmt_expr.value,
+                    Expr::Call(ExprCall { func, arguments: Arguments { args, .. }, .. })
+                    if matches!(&**func, Expr::Name(name) if name.id.as_str() == "prod_assert")
+                    && (args.len() == 1 || args.len() == 2)
+                ) =>
+            {
+                // Destructure in body; the guard already verified the shape.
+                let expr_range = stmt_expr.range;
+                let Expr::Call(call) = *stmt_expr.value else {
+                    unreachable!("guarded by matches! above")
+                };
+                let call_range = call.range;
+                let args = call.arguments.args;
                 let (test, msg) = if args.len() == 1 {
                     (args[0].clone(), None)
                 } else if args.len() == 2 {

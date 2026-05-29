@@ -12,6 +12,7 @@ use std::fmt::Display;
 use std::sync::Arc;
 
 use dupe::Dupe;
+use itertools::Itertools;
 use pyrefly_graph::index::Idx;
 use pyrefly_graph::index::Index;
 use pyrefly_graph::index_map::IndexMap;
@@ -34,6 +35,7 @@ use ruff_python_ast::Identifier;
 use ruff_python_ast::ModModule;
 use ruff_python_ast::Parameter;
 use ruff_python_ast::Stmt;
+use ruff_python_ast::StmtClassDef;
 use ruff_python_ast::TypeParam;
 use ruff_python_ast::TypeParams;
 use ruff_python_ast::name::Name;
@@ -47,11 +49,12 @@ use ruff_text_size::TextSize;
 use starlark_map::Hashed;
 use starlark_map::small_map::SmallMap;
 use starlark_map::small_set::SmallSet;
-use vec1::vec1;
+use vec1::Vec1;
 
 use crate::binding::binding::AnnotationTarget;
 use crate::binding::binding::Binding;
 use crate::binding::binding::BindingAnnotation;
+use crate::binding::binding::BindingClass;
 use crate::binding::binding::BindingDjangoRelations;
 use crate::binding::binding::BindingExpect;
 use crate::binding::binding::BindingExport;
@@ -96,13 +99,13 @@ use crate::binding::table::TableKeyed;
 use crate::config::base::InferReturnTypes;
 use crate::config::error_kind::ErrorKind;
 use crate::error::collector::ErrorCollector;
-use crate::error::context::ErrorInfo;
 use crate::export::definitions::MutableCaptureKind;
 use crate::export::exports::Exports;
 use crate::export::exports::LookupExport;
 use crate::export::special::SpecialExport;
 use crate::module::module_info::ModuleInfo;
 use crate::solver::solver::Solver;
+use crate::state::errors::ModuleRanges;
 use crate::state::loader::FindError;
 use crate::state::loader::FindingOrError;
 use crate::table;
@@ -191,7 +194,12 @@ struct BindingsInner {
     module_info: ModuleInfo,
     table: BindingTable,
     metadata: Arc<BindingsMetadata>,
+    /// Multi-line ranges and ignore-all directives, computed from the AST
+    /// here, before the AST is evicted from memory. Used for error suppression.
+    module_ranges: Arc<ModuleRanges>,
     scope_trace: Option<ScopeTrace>,
+    /// Names `del`eted at module scope; retained outside the LSP `scope_trace`.
+    module_deletes: SmallSet<Name>,
     unused_parameters: Vec<UnusedParameter>,
     unused_imports: Vec<UnusedImport>,
     unused_variables: Vec<UnusedVariable>,
@@ -340,7 +348,12 @@ impl Bindings {
             module_info,
             table: Default::default(),
             metadata: Arc::new(BindingsMetadata::new()),
+            module_ranges: Arc::new(ModuleRanges {
+                multi_line: Vec::new(),
+                ignore_all: SmallMap::new(),
+            }),
             scope_trace: None,
+            module_deletes: SmallSet::new(),
             unused_parameters: Vec::new(),
             unused_imports: Vec::new(),
             unused_variables: Vec::new(),
@@ -366,11 +379,26 @@ impl Bindings {
         &self.0.metadata
     }
 
+    pub fn module_ranges(&self) -> &Arc<ModuleRanges> {
+        &self.0.module_ranges
+    }
+
     /// Look up pre-computed class fields by `ClassDefIndex`. O(1) Vec index.
     /// Returns `None` if the index is out of bounds (e.g., stale cross-module
     /// index after incremental rebuild).
     pub fn get_class_fields(&self, idx: ClassDefIndex) -> Option<&ClassFields> {
         Some(&self.0.metadata.get_class_checked(idx)?.fields)
+    }
+
+    /// Per-module class index for a class definition statement (`ClassDefIndex`),
+    /// used for `KeyClassField` / `ClassFields` lookups.
+    pub fn class_def_index(&self, class_def: &StmtClassDef) -> Option<ClassDefIndex> {
+        let key = KeyClass(ShortIdentifier::new(&class_def.name));
+        let idx = self.key_to_idx_hashed_opt(Hashed::new(&key))?;
+        match self.get(idx) {
+            BindingClass::ClassDef(c) => Some(c.def_index),
+            BindingClass::FunctionalClassDef(d, ..) => Some(*d),
+        }
     }
 
     pub fn unused_parameters(&self) -> &[UnusedParameter] {
@@ -414,6 +442,11 @@ impl Bindings {
     /// initialized by a non-annotated assignment (tuple unpacking, walrus, `with … as`).
     pub fn subsequently_initialized(&self, ann: Idx<KeyAnnotation>) -> bool {
         self.0.subsequently_initialized.contains(&ann)
+    }
+
+    /// Names `del`eted at module scope.
+    pub fn module_deletes(&self) -> &SmallSet<Name> {
+        &self.0.module_deletes
     }
 
     pub fn available_definitions(&self, position: TextSize) -> SmallSet<Idx<Key>> {
@@ -532,7 +565,7 @@ impl Bindings {
 
     pub fn function_has_return_annotation(&self, name: &Identifier) -> bool {
         let b = self.get(self.key_to_idx(&Key::ReturnType(ShortIdentifier::new(name))));
-        if let Binding::ReturnType(box r) = b {
+        if let Binding::ReturnType(r) = b {
             r.kind.has_return_annotation()
         } else if matches!(b, Binding::Any(_)) {
             // This happens when we have an un-annotated return & the inference behavior is "skip and infer Any"
@@ -562,6 +595,10 @@ impl Bindings {
         analyze_unannotated_for_ide: bool,
         infer_return_types: InferReturnTypes,
     ) -> Self {
+        // Compute module ranges from the AST before consuming it. These are
+        // needed later for error collection, which runs after the AST may
+        // have been evicted.
+        let module_ranges = Arc::new(ModuleRanges::compute(&x, &module_info));
         let mut builder = BindingsBuilder {
             module_info: module_info.dupe(),
             lookup,
@@ -644,11 +681,10 @@ impl Bindings {
         let semantic_errors = builder.semantic_syntax_errors.into_inner();
         for error in semantic_errors {
             if Self::should_emit_semantic_syntax_error(&error) {
-                builder.errors.add(
-                    error.range,
-                    ErrorInfo::Kind(ErrorKind::InvalidSyntax),
-                    vec1![error.to_string()],
-                );
+                builder
+                    .errors
+                    .error_builder(error.range, ErrorKind::InvalidSyntax, error.to_string())
+                    .emit();
             }
         }
 
@@ -691,15 +727,18 @@ impl Bindings {
                 fields: builder.django_relation_fields.into_boxed_slice(),
             },
         );
+        let module_deletes = scope_trace.module_deletes().clone();
         Self(Arc::new(BindingsInner {
             module_info,
             table: builder.table,
             metadata: Arc::new(builder.metadata),
+            module_ranges,
             scope_trace: if enable_trace {
                 Some(scope_trace)
             } else {
                 None
             },
+            module_deletes,
             unused_parameters: builder.unused_parameters,
             unused_imports: builder.unused_imports,
             unused_variables: builder.unused_variables,
@@ -1326,14 +1365,11 @@ impl<'a> BindingsBuilder<'a> {
                     .map(FlowStyle::assume_initialized)
                     .unwrap_or(FlowStyle::Other);
                 self.scopes.define_in_current_flow(hashed_name, idx, style);
-                if let Some(narrow_idx) = capture_info.narrow_idx {
-                    // Only propagate type-guard narrows (isinstance, is not None,
-                    // etc.), not assignment narrows from subscript/attribute writes.
-                    // Assignment narrows track mutations and should not leak into
-                    // nested scopes.
-                    if matches!(self.idx_to_binding(narrow_idx), Some(Binding::Narrow(..))) {
-                        self.scopes.narrow_in_current_flow(hashed_name, narrow_idx);
-                    }
+                if let Some(narrow_idx) = capture_info.narrow_idx
+                    && let Some((_, Some(Binding::Narrow(_, _, _)))) =
+                        self.get_original_binding(narrow_idx)
+                {
+                    self.scopes.narrow_in_current_flow(hashed_name, narrow_idx);
                 }
             }
         }
@@ -1509,13 +1545,9 @@ impl<'a> BindingsBuilder<'a> {
                 {
                     self.mark_first_use(def_idx, current_idx);
                 }
-            } else {
-                // Narrowing or other reads: mark as DoesNotPin if still undetermined.
-                if matches!(first_use, FirstUse::Undetermined) {
-                    self.mark_does_not_pin_if_first_use(def_idx);
-                }
             }
-
+            // Narrowing reads leave first_use as Undetermined so that the next
+            // non-narrowing read can still become the first use for pinning.
             // All partial type reads forward to the NameAssign (def_idx).
             self.insert_binding_idx(deferred.bound_name_idx, Binding::ForwardToFirstUse(def_idx));
         } else {
@@ -1874,10 +1906,11 @@ impl<'a> BindingsBuilder<'a> {
         usage: &Usage,
     ) {
         for (name, (op, op_range)) in narrow_ops.0.iter_hashed() {
-            // Narrowing operations should not pin partial types
+            // Narrowing operations should not pin partial types, but they also
+            // should not permanently block pinning. Leave the first-use state
+            // as Undetermined so a subsequent non-narrowing read can still pin.
             let mut narrowing_usage = Usage::narrowing_from(usage);
             if let Some(initial_idx) = self.lookup_name(name, &mut narrowing_usage).found() {
-                self.mark_does_not_pin_if_first_use(initial_idx);
                 let narrowed_idx = self.insert_binding(
                     Key::Narrow(Box::new((name.into_key().clone(), *op_range, use_location))),
                     Binding::Narrow(initial_idx, Box::new(op.clone()), use_location),
@@ -1938,13 +1971,15 @@ impl<'a> BindingsBuilder<'a> {
 pub enum LegacyTParamId {
     /// A simple name referring to a legacy type parameter.
     Name(Identifier),
-    /// A <name>.<name> reference to a legacy type parameter.
-    Attr(Identifier, Identifier),
+    /// A dotted reference to a legacy type parameter. The first `Identifier` is the
+    /// base name looked up in scope; the `Vec1` is the attribute chain applied to it.
+    /// For example `mod.T` is `Attr(mod, [T])` and `pkg.mod.T` is `Attr(pkg, [mod, T])`.
+    Attr(Identifier, Vec1<Identifier>),
 }
 
 impl LegacyTParamId {
     /// Get the identifier of the name that will actually be bound (for a normal name, this is
-    /// just itself; for a `<base>.<attr>` attribute it is the base portion, which gets narrowed).
+    /// just itself; for a dotted attribute chain it is the base portion, which gets narrowed).
     fn as_identifier(&self) -> &Identifier {
         match self {
             Self::Name(name) => name,
@@ -1967,7 +2002,9 @@ impl LegacyTParamId {
     fn tvar_name(&self) -> String {
         match self {
             Self::Name(name) => name.id.as_str().to_owned(),
-            Self::Attr(base, attr) => format!("{base}.{attr}"),
+            Self::Attr(base, attrs) => {
+                format!("{base}.{}", attrs.iter().map(|a| a.as_str()).join("."))
+            }
         }
     }
 }
@@ -1976,7 +2013,7 @@ impl Ranged for LegacyTParamId {
     fn range(&self) -> TextRange {
         match self {
             Self::Name(name) => name.range,
-            Self::Attr(_, attr) => attr.range,
+            Self::Attr(_, attrs) => attrs.last().range,
         }
     }
 }
@@ -2217,10 +2254,13 @@ impl<'a> BindingsBuilder<'a> {
                 )),
                 Some(_) => None,
             },
-            LegacyTParamId::Attr(_, attr) => match binding {
+            LegacyTParamId::Attr(_, attrs) => match binding {
                 Some(Binding::Module(..) | Binding::Import(..)) | None => Some((
-                    KeyLegacyTypeParam(ShortIdentifier::new(attr)),
-                    BindingLegacyTypeParam::ModuleKeyed(original_idx, Box::new(attr.id.clone())),
+                    KeyLegacyTypeParam(ShortIdentifier::new(attrs.last())),
+                    BindingLegacyTypeParam::ModuleKeyed(
+                        original_idx,
+                        Box::new(attrs.mapped_ref(|a| a.id.clone())),
+                    ),
                 )),
                 Some(_) => None,
             },

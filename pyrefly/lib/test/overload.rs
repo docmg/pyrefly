@@ -1575,6 +1575,23 @@ def g(x: str, y: int):
 );
 
 testcase!(
+    test_filter_selects_typeis_overload,
+    r#"
+import ast
+from typing import TypeIs, assert_type
+
+type IsDef = ast.FunctionDef | ast.ClassDef
+
+def is_def(n: object) -> TypeIs[IsDef]:
+    return isinstance(n, ast.FunctionDef | ast.ClassDef)
+
+def f(node: ast.ClassDef):
+    for child in filter(is_def, node.body):
+        assert_type(child, ast.ClassDef | ast.FunctionDef)
+    "#,
+);
+
+testcase!(
     test_tuple_any_with_tuple_ambigious_overload,
     r#"
 from typing import Any, Literal, Never, overload, assert_type
@@ -1940,5 +1957,25 @@ def f(x):
 
 def g(x: float):
     f(x)  # E: No matching overload
+    "#,
+);
+
+testcase!(
+    test_callback_protocol_with_overloads_and_bounded_typevar,
+    r#"
+from typing import Callable, Protocol, overload
+
+class Base: ...
+
+class HasCall(Protocol):
+    @overload
+    def __call__[T: Base](self, arg: T) -> T: ...
+    @overload
+    def __call__(self, arg: float) -> float: ...
+
+def takes(f: Callable[[float], float]) -> None: ...
+
+def repro(p: HasCall):
+    takes(p)
     "#,
 );

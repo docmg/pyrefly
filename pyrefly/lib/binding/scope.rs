@@ -50,6 +50,7 @@ use crate::binding::binding::KeyClass;
 use crate::binding::binding::KeyClassBaseType;
 use crate::binding::binding::KeyClassMetadata;
 use crate::binding::binding::KeyClassMro;
+use crate::binding::binding::KeyClassSubscriptSymmetry;
 use crate::binding::binding::KeyClassSynthesizedFields;
 use crate::binding::binding::KeyConsistentOverrideCheck;
 use crate::binding::binding::KeyDecoratedFunction;
@@ -403,8 +404,8 @@ impl Static {
     }
 
     /// Populate static definitions from a list of statements.
-    /// Returns the set of implicit captures (names read but not locally defined)
-    /// and a map of Final variable string values.
+    /// Returns the set of implicit captures (names read but not locally defined),
+    /// the set of all Final names, and a map of Final variable string values.
     fn stmts(
         &mut self,
         x: &[Stmt],
@@ -414,7 +415,7 @@ impl Static {
         sys_info: SysInfo,
         get_annotation_idx: &mut impl FnMut(ShortIdentifier) -> Idx<KeyAnnotation>,
         scopes: Option<&Scopes>,
-    ) -> (SmallSet<Name>, SmallMap<Name, String>) {
+    ) -> (SmallSet<Name>, SmallSet<Name>, SmallMap<Name, String>) {
         let mut d = Definitions::new(
             x,
             module_info.name(),
@@ -463,12 +464,13 @@ impl Static {
                 self.upsert(name.cloned(), range, StaticStyle::MergeableImport, range)
             }
         }
+        let final_names = d.final_names.keys().cloned().collect();
         let final_string_values = d
             .final_names
             .into_iter()
             .filter_map(|(name, value)| value.map(|v| (name, v)))
             .collect();
-        (implicit_captures, final_string_values)
+        (implicit_captures, final_names, final_string_values)
     }
 
     fn expr_lvalue(&mut self, x: &Expr) {
@@ -896,6 +898,7 @@ pub struct ClassIndices {
     pub variance_check_idx: Idx<KeyVarianceCheck>,
     pub consistent_override_check_idx: Idx<KeyConsistentOverrideCheck>,
     pub abstract_class_check_idx: Idx<KeyAbstractClassCheck>,
+    pub subscript_symmetry_idx: Idx<KeyClassSubscriptSymmetry>,
 }
 
 #[derive(Clone, Debug)]
@@ -1204,9 +1207,14 @@ pub struct Scope {
     /// from enclosing scopes. Populated during `init_current_static` from the
     /// `Definitions` phase. Used to seed flow entries for captured variables.
     implicit_captures: SmallSet<Name>,
+    /// All names marked `Final` in this scope. Used to prevent literal
+    /// promotion so that `Final` variables preserve their literal types.
+    final_names: SmallSet<Name>,
     /// Names marked `Final` with string literal values, e.g. `X: Final = "x"`.
     /// Used to resolve Final variable references in synthesized class field names.
     final_string_values: SmallMap<Name, String>,
+    /// Names removed by a `del NAME` statement in this scope.
+    deleted_names: SmallSet<Name>,
 }
 
 impl Scope {
@@ -1225,7 +1233,9 @@ impl Scope {
             finally_depth: 0,
             with_depth: 0,
             implicit_captures: SmallSet::new(),
+            final_names: SmallSet::new(),
             final_string_values: SmallMap::new(),
+            deleted_names: SmallSet::new(),
         }
     }
 
@@ -1671,7 +1681,7 @@ impl Scopes {
         get_annotation_idx: &mut impl FnMut(ShortIdentifier) -> Idx<KeyAnnotation>,
     ) {
         let mut initialize = |scope: &mut Scope, myself: Option<&Self>| {
-            let (implicit_captures, final_string_values) = scope.stat.stmts(
+            let (implicit_captures, final_names, final_string_values) = scope.stat.stmts(
                 x,
                 module_info,
                 top_level,
@@ -1681,6 +1691,7 @@ impl Scopes {
                 myself,
             );
             scope.implicit_captures = implicit_captures;
+            scope.final_names = final_names;
             scope.final_string_values = final_string_values;
             // Presize the flow, as its likely to need as much space as static
             scope.flow.info.reserve(scope.stat.0.capacity());
@@ -1697,6 +1708,11 @@ impl Scopes {
             initialize(&mut current, Some(self));
             self.push(current);
         }
+    }
+
+    /// Check if a name is declared as `Final` at module scope.
+    pub fn is_final_at_module_scope(&self, name: &Name) -> bool {
+        self.scopes.first().scope.final_names.contains(name)
     }
 
     /// Look up a Final variable's string literal value in the current scope stack.
@@ -2076,9 +2092,11 @@ impl Scopes {
     /// Don't change the type if one is present - downstream we'll emit
     /// uninitialized local errors but keep using our best guess for the type.
     pub fn mark_as_deleted(&mut self, name: &Name) {
-        if let Some(value) = self.current_mut().flow.get_value_mut(name) {
+        let scope = self.current_mut();
+        if let Some(value) = scope.flow.get_value_mut(name) {
             value.style = FlowStyle::Uninitialized;
         }
+        scope.deleted_names.insert(name.clone());
     }
 
     fn get_flow_info(&self, name: &Name) -> Option<&FlowInfo> {
@@ -2925,6 +2943,16 @@ impl Scopes {
             // compiler has identified as local shadows enclosing scopes, so we should prefer
             // inner static lookups to outer flow lookups.
             if !is_class && let Some(static_info) = scope.stat.0.get_hashed(name) {
+                // A walrus operator's target is added to the comprehension's
+                // static scope (via `add_lvalue_to_current_static`) before the
+                // walrus write adds it to flow. When reading the name before
+                // that write, skip this scope so visit_scopes continues to the
+                // enclosing scope — which correctly handles class-scope-skipping
+                // and flow barriers.
+                if matches!(scope.kind, ScopeKind::Comprehension { .. }) && flow_info.is_none() {
+                    return None;
+                }
+
                 let forward_ref_key = static_info.as_key(name.into_key());
                 return Some(NameReadInfo::Anywhere {
                     key: forward_ref_key,
@@ -3027,6 +3055,11 @@ pub struct ScopeTrace(ScopeTreeNode);
 impl ScopeTrace {
     pub fn toplevel_scope(&self) -> &Scope {
         &self.0.scope
+    }
+
+    /// Names `del`eted at module scope.
+    pub fn module_deletes(&self) -> &SmallSet<Name> {
+        &self.0.scope.deleted_names
     }
 
     pub fn exportables(&self) -> SmallMap<Name, Exportable> {

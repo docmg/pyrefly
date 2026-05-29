@@ -31,7 +31,6 @@ use pyrefly_python::short_identifier::ShortIdentifier;
 use pyrefly_python::symbol_kind::SymbolKind;
 use pyrefly_python::sys_info::SysInfo;
 use pyrefly_types::type_alias::TypeAliasData;
-use pyrefly_types::types::Union;
 use pyrefly_util::gas::Gas;
 use pyrefly_util::lock::Mutex;
 use pyrefly_util::prelude::SliceExt;
@@ -212,6 +211,7 @@ pub enum TypeCheckingMode {
     Legacy,
     Default,
     Strict,
+    All,
 }
 
 impl From<TypeCheckingMode> for pyrefly_config::resolve_unconfigured::UnconfiguredOverride {
@@ -224,6 +224,7 @@ impl From<TypeCheckingMode> for pyrefly_config::resolve_unconfigured::Unconfigur
             TypeCheckingMode::Legacy => Inner::Legacy,
             TypeCheckingMode::Default => Inner::Default,
             TypeCheckingMode::Strict => Inner::Strict,
+            TypeCheckingMode::All => Inner::All,
         }
     }
 }
@@ -1238,12 +1239,17 @@ impl<'a> Transaction<'a> {
         match ty {
             Type::ClassType(class_type) => solver.type_order().instance_as_dunder_call(&class_type),
             Type::SelfType(class_type) => solver.type_order().instance_as_dunder_call(&class_type),
-            Type::Union(box Union { members, .. }) => Self::callable_from_types(solver, members),
-            Type::TypeAlias(box TypeAliasData::Value(alias)) => {
-                Self::callable_from_type(solver, alias.as_type())
+            Type::Union(u) => Self::callable_from_types(solver, u.members),
+            Type::TypeAlias(data) if matches!(*data, TypeAliasData::Value(_)) => {
+                // Repeated match because pattern guards cannot move out of bindings.
+                if let TypeAliasData::Value(alias) = *data {
+                    Self::callable_from_type(solver, alias.as_type())
+                } else {
+                    unreachable!("guarded by matches! above")
+                }
             }
-            Type::Type(box inner) => Self::callable_from_type(solver, inner),
-            Type::Quantified(box quantified) => match quantified.restriction {
+            Type::Type(inner) => Self::callable_from_type(solver, *inner),
+            Type::Quantified(quantified) => match quantified.restriction {
                 Restriction::Bound(bound) => Self::callable_from_type(solver, bound),
                 Restriction::Constraints(options) => Self::callable_from_types(solver, options),
                 Restriction::Unrestricted => None,
@@ -1695,6 +1701,10 @@ impl<'a> Transaction<'a> {
     /// instance, find `__call__`. Returns all found definitions, or empty if
     /// neither case applies. Does not match functions/callables — those should
     /// use the normal go-to-definition path.
+    ///
+    /// When a class synthesizes its own `__init__` or `__new__` (e.g.
+    /// dataclass, pydantic, TypedDict, NamedTuple), we skip the corresponding
+    /// MRO lookup so the caller falls through to the class definition.
     fn find_call_target_definitions(
         &self,
         handle: &Handle,
@@ -1702,7 +1712,20 @@ impl<'a> Transaction<'a> {
         ty: Type,
     ) -> Vec<FindDefinitionItemWithDocstring> {
         match &ty {
-            Type::ClassDef(_) => {
+            Type::ClassDef(cls) => {
+                let has_synthesized_constructor = self
+                    .ad_hoc_solve(handle, "check_synthesized_ctor", |solver| {
+                        solver
+                            .get_synthesized_field_from_current_class_only(cls, &dunder::INIT)
+                            .is_some()
+                            || solver
+                                .get_synthesized_field_from_current_class_only(cls, &dunder::NEW)
+                                .is_some()
+                    })
+                    .unwrap_or(false);
+                if has_synthesized_constructor {
+                    return vec![];
+                }
                 let mut defs = self
                     .find_attribute_definition_for_base_type(
                         handle,
@@ -1765,7 +1788,7 @@ impl<'a> Transaction<'a> {
     /// Returns `Err(DefinitionNotFound)` if the attribute doesn't exist
     /// on any branch of a union type. The returned `Vec1` is guaranteed
     /// non-empty.
-    fn find_attribute_definition_for_base_type(
+    pub(crate) fn find_attribute_definition_for_base_type(
         &self,
         handle: &Handle,
         preference: FindPreference,
@@ -1777,8 +1800,20 @@ impl<'a> Transaction<'a> {
                 let completions = |ty| solver.completions(ty, Some(name), false);
 
                 match base_type {
-                    Type::Union(box Union { members: tys, .. }) | Type::Intersect(box (tys, _)) => {
-                        tys.into_iter()
+                    Type::Union(u) => u
+                        .members
+                        .into_iter()
+                        .filter_map(|ty_| {
+                            self.find_definition_for_base_type(
+                                handle,
+                                preference,
+                                completions(ty_),
+                                name,
+                            )
+                        })
+                        .collect(),
+                    Type::Intersect(i) => {
+                        i.0.into_iter()
                             .filter_map(|ty_| {
                                 self.find_definition_for_base_type(
                                     handle,
@@ -2674,6 +2709,20 @@ impl<'a> Transaction<'a> {
                         }
                     }
                 }
+                ErrorKind::UnnecessaryTypeConversion => {
+                    if let Some(action) =
+                        quick_fixes::unnecessary_type_conversion::unnecessary_type_conversion_code_action(
+                            &module_info,
+                            &ast,
+                            error_range,
+                        )
+                    {
+                        let call_range = action.2;
+                        if error_range.contains_range(range) || call_range.contains_range(range) {
+                            other_actions.push(action);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -2970,6 +3019,14 @@ impl<'a> Transaction<'a> {
         quick_fixes::convert_star_import::convert_star_import_code_actions(self, handle, selection)
     }
 
+    pub fn convert_dict_code_actions(
+        &self,
+        handle: &Handle,
+        selection: TextRange,
+    ) -> Option<Vec<LocalRefactorCodeAction>> {
+        quick_fixes::convert_dict::convert_dict_code_actions(self, handle, selection)
+    }
+
     /// Determines whether a module is a third-party package.
     ///
     /// Checks if the module's path is located within any of the configured
@@ -3156,6 +3213,9 @@ impl<'a> Transaction<'a> {
         .concat()
     }
 
+    /// Find references to an external definition within the given handle's module.
+    /// When the exact byte-range comparison fails (e.g. CRLF/LF differences),
+    /// falls back to comparing line numbers, which are encoding-invariant.
     fn local_references_from_external_definition(
         &self,
         handle: &Handle,
@@ -3165,6 +3225,10 @@ impl<'a> Transaction<'a> {
         let index = self.get_solutions(handle)?.get_index()?;
         let index = index.lock();
         let mut references = Vec::new();
+
+        // Lazily computed line number for fallback comparison.
+        let definition_line = || module.to_lsp_position(definition_range.start()).line;
+
         for ((imported_module_name, imported_name), ranges) in index
             .externally_defined_variable_references
             .iter()
@@ -3176,7 +3240,8 @@ impl<'a> Transaction<'a> {
                 imported_name.clone(),
                 FindPreference::default(),
             ) && imported_handle.path().as_path() == module.path().as_path()
-                && export.location == definition_range
+                && (export.location == definition_range
+                    || module.to_lsp_position(export.location.start()).line == definition_line())
             {
                 references.extend(ranges.iter().copied());
             }
@@ -3186,7 +3251,9 @@ impl<'a> Transaction<'a> {
         {
             if attribute_module_path == module.path() {
                 for (def_range, ref_range) in def_and_ref_ranges {
-                    if def_range == &definition_range {
+                    if *def_range == definition_range
+                        || module.to_lsp_position(def_range.start()).line == definition_line()
+                    {
                         references.push(*ref_range);
                     }
                 }
@@ -3931,18 +3998,25 @@ fn patch_definition_for_handle_impl<T: RdepTransaction>(
     match definition.module.path().details() {
         ModulePathDetails::Memory(path_buf) if handle.path() != definition.module.path() => {
             let TextRangeWithModule { module, range } = definition;
-            let module = if let Some(info) = transaction.module_info(&Handle::new(
+            let new_module = if let Some(info) = transaction.module_info(&Handle::new(
                 module.name(),
                 ModulePath::filesystem((**path_buf).clone()),
                 handle.sys_info().dupe(),
             )) {
                 info
             } else {
-                module.dupe()
+                return TextRangeWithModule {
+                    module: module.dupe(),
+                    range: *range,
+                };
             };
+            // Remap range from in-memory to on-disk byte offsets so that
+            // module and range stay consistent (e.g. when CRLF/LF differ).
+            let lsp_range = module.to_lsp_range(*range);
+            let range = new_module.from_lsp_range(lsp_range, None);
             TextRangeWithModule {
-                module,
-                range: *range,
+                module: new_module,
+                range,
             }
         }
         _ => definition.clone(),

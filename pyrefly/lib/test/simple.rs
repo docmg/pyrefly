@@ -1186,6 +1186,16 @@ assert_type(A, type[A])
 );
 
 testcase!(
+    test_assert_type_metaclass,
+    r#"
+from typing import assert_type
+class Meta(type): pass
+class A(metaclass=Meta): pass
+assert_type(A, Meta)  # E: assert_type(type[A], Meta) failed
+    "#,
+);
+
+testcase!(
     test_compare_int_str_error,
     r#"
 0 < "oops"  # E: Argument `Literal['oops']` is not assignable to parameter `value` with type `int`
@@ -1226,6 +1236,36 @@ testcase!(
     test_syntax_error_resulting_in_empty_defintion,
     r#"
 @:a=1 # E: Parse # E: Could not find name `a`
+    "#,
+);
+
+testcase!(
+    test_syntax_error_empty_decorator_slice,
+    r#"
+@:[ # E: Parse # E: Parse
+    "#,
+);
+
+testcase!(
+    test_syntax_error_empty_match_star,
+    r#"
+x = object()
+match x:
+    case [*]: # E: Parse
+        pass
+    "#,
+);
+
+testcase!(
+    test_syntax_error_empty_match_bindings,
+    r#"
+x = object()
+match x:
+    case as: # E: Parse
+        pass
+match x:
+    case {**}: # E: Parse
+        pass
     "#,
 );
 
@@ -1820,6 +1860,14 @@ testcase!(
 );
 
 testcase!(
+    test_crash_on_incomplete_named_walrus_attribute_annotation,
+    r#"
+# Regression test for https://github.com/facebook/pyrefly/issues/3344
+(a:=).:b  # E: Cannot annotate non-self attribute `a:=.` # E: Parse error: Expected an expression # E: Parse error: Expected an identifier # E: Could not find name `b`
+"#,
+);
+
+testcase!(
     test_crash_on_incomplete_walrus,
     r#"
 # Regression test for https://github.com/facebook/pyrefly/issues/2093
@@ -2384,6 +2432,33 @@ def f(x):
     y &= x
     assert_type(y, Any)
     "#,
+);
+
+// Regression test for https://github.com/facebook/pyrefly/issues/2221
+testcase!(
+    test_shutil_copyfileobj_with_urlopen,
+    r#"
+import shutil
+import urllib.request as request
+with request.urlopen("https://example.com") as remote, open("out.html", 'wb') as local:
+    shutil.copyfileobj(remote, local)
+"#,
+);
+
+// Regression test for https://github.com/facebook/pyrefly/issues/2866
+testcase!(
+    test_reduce_gcd_return_type,
+    r#"
+from functools import reduce
+from math import gcd
+
+def detect_indentation(values: list[int]) -> int:
+    try:
+        indentation = reduce(gcd, [v for v in values if not v % 2]) or 1
+    except TypeError:
+        indentation = 1
+    return indentation
+"#,
 );
 
 // Regression test for https://github.com/facebook/pyrefly/issues/3048

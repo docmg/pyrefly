@@ -23,13 +23,11 @@ use ruff_text_size::TextRange;
 use starlark_map::small_map::SmallMap;
 use starlark_map::small_set::SmallSet;
 use vec1::Vec1;
-use vec1::vec1;
 
 use crate::alt::class::class_field::ClassField;
 use crate::alt::types::pydantic::PydanticModelKind;
 use crate::config::error_kind::ErrorKind;
 use crate::error::collector::ErrorCollector;
-use crate::error::context::ErrorInfo;
 use crate::types::class::Class;
 use crate::types::class::ClassType;
 use crate::types::display::ClassDisplayContext;
@@ -76,6 +74,9 @@ pub struct ClassMetadata {
     /// Whether this class is a metaclass (i.e., a subclass of `type`).
     is_metaclass: bool,
     slots_info: Option<SlotsInfo>,
+    /// `__init__` parameter names to capture for shape inference, extracted from
+    /// `@uses_shape_dsl(..., capture_init=[...])` on a `forward` method.
+    capture_init: Option<Vec<Name>>,
 }
 
 impl VisitMut<Type> for ClassMetadata {
@@ -134,6 +135,7 @@ impl ClassMetadata {
         is_factory_boy_factory: bool,
         is_metaclass: bool,
         slots_info: Option<SlotsInfo>,
+        capture_init: Option<Vec<Name>>,
     ) -> ClassMetadata {
         ClassMetadata {
             metaclass,
@@ -160,6 +162,7 @@ impl ClassMetadata {
             is_factory_boy_factory,
             is_metaclass,
             slots_info,
+            capture_init,
         }
     }
 
@@ -189,6 +192,7 @@ impl ClassMetadata {
             is_factory_boy_factory: false,
             is_metaclass: false,
             slots_info: None,
+            capture_init: None,
         }
     }
 
@@ -347,6 +351,10 @@ impl ClassMetadata {
 
     pub fn django_model_metadata(&self) -> Option<&DjangoModelMetadata> {
         self.django_model_metadata.as_ref()
+    }
+
+    pub fn capture_init(&self) -> Option<&[Name]> {
+        self.capture_init.as_deref()
     }
 }
 
@@ -752,17 +760,19 @@ impl Linearization {
                             let ctx = ClassDisplayContext::new(&[cls, ctype.class_object()]);
                             // TODO: Extend this error message to say where in the class bases the mismatch comes from
                             // we will need to wire additional information for this.
-                            errors.add(
-                                cls.range(),
-                                ErrorInfo::Kind(ErrorKind::InvalidInheritance),
-                                vec1![format!(
-                                    "Class `{}` has inconsistent type arguments for base class `{}`: `{}` and `{}`",
-                                    ctx.display(cls),
-                                    ctx.display(ctype.class_object()),
-                                    Type::ClassType(prev.clone()),
-                                    Type::ClassType(ctype.clone()),
-                                )],
-                            );
+                            errors
+                                .error_builder(
+                                    cls.range(),
+                                    ErrorKind::InvalidInheritance,
+                                    format!(
+                                        "Class `{}` has inconsistent type arguments for base class `{}`: `{}` and `{}`",
+                                        ctx.display(cls),
+                                        ctx.display(ctype.class_object()),
+                                        Type::ClassType(prev.clone()),
+                                        Type::ClassType(ctype.clone()),
+                                    ),
+                                )
+                                .emit();
                             true
                         } else {
                             seen_ancestors.insert(ctype.class_object().dupe(), ctype.clone());
@@ -787,15 +797,17 @@ impl Linearization {
                 ClassMro::Cyclic => {
                     let base = base.class_object();
                     let ctx = ClassDisplayContext::new(&[cls, base]);
-                    errors.add(
-                        cls.range(),
-                        ErrorInfo::Kind(ErrorKind::InvalidInheritance),
-                        vec1![format!(
-                            "Class `{}` inheriting from `{}` creates a cycle",
-                            ctx.display(cls),
-                            ctx.display(base),
-                        )],
-                    );
+                    errors
+                        .error_builder(
+                            cls.range(),
+                            ErrorKind::InvalidInheritance,
+                            format!(
+                                "Class `{}` inheriting from `{}` creates a cycle",
+                                ctx.display(cls),
+                                ctx.display(base),
+                            ),
+                        )
+                        .emit();
                     // Signal that we detected a cycle
                     return Linearization::Cyclic;
                 }
@@ -871,15 +883,17 @@ impl Linearization {
                     .class_object()
                     .dupe();
                 let ctx = ClassDisplayContext::new(&[cls, first_candidate]);
-                errors.add(
-                    cls.range(),
-                    ErrorInfo::Kind(ErrorKind::InvalidInheritance),
-                    vec1![format!(
-                        "Class `{}` has a nonlinearizable inheritance chain detected at `{}`",
-                        ctx.display(cls),
-                        ctx.display(first_candidate),
-                    )],
-                );
+                errors
+                    .error_builder(
+                        cls.range(),
+                        ErrorKind::InvalidInheritance,
+                        format!(
+                            "Class `{}` has a nonlinearizable inheritance chain detected at `{}`",
+                            ctx.display(cls),
+                            ctx.display(first_candidate),
+                        ),
+                    )
+                    .emit();
 
                 ancestor_chains = Vec::new()
             }

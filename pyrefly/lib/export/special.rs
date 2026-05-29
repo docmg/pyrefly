@@ -71,6 +71,8 @@ pub enum SpecialExport {
     Final,
     TypingMapping,
     TypeForm,
+    UsesShapeDsl,
+    ShapeDslFunction,
 }
 
 impl SpecialExport {
@@ -133,6 +135,8 @@ impl SpecialExport {
             "Final" => Some(Self::Final),
             "Mapping" => Some(Self::TypingMapping),
             "TypeForm" => Some(Self::TypeForm),
+            "uses_shape_dsl" => Some(Self::UsesShapeDsl),
+            "shape_dsl_function" => Some(Self::ShapeDslFunction),
             _ => None,
         }
     }
@@ -140,7 +144,10 @@ impl SpecialExport {
     pub fn defined_in(self, m: ModuleName) -> bool {
         match self {
             Self::TypeVar | Self::TypeVarTuple => {
-                matches!(m.as_str(), "typing" | "typing_extensions" | "torch_shapes")
+                matches!(
+                    m.as_str(),
+                    "typing" | "typing_extensions" | "shape_extensions"
+                )
             }
             Self::TypeAlias
             | Self::ParamSpec
@@ -201,6 +208,8 @@ impl SpecialExport {
                 "typing" | "typing_extensions" | "collections.abc"
             ),
             Self::Deprecated => matches!(m.as_str(), "warnings" | "typing_extensions"),
+            Self::UsesShapeDsl => matches!(m.as_str(), "shape_extensions"),
+            Self::ShapeDslFunction => matches!(m.as_str(), "shape_extensions.dsl"),
         }
     }
 

@@ -540,3 +540,36 @@ f(d, 42)
 assert_type(d, dict[str, int])
     "#,
 );
+
+testcase!(
+    test_container_literal_no_implicit_any,
+    TestEnv::new().enable_implicit_any_error(),
+    r#"
+from typing import assert_type
+
+foo = {"a": 1, "b": None}
+assert_type(foo["a"], int)
+assert_type(foo["b"], None)
+assert_type(foo, dict[str, int | None])
+
+bar = [1, None]
+assert_type(bar, list[int | None])
+    "#,
+);
+
+// Regression test: narrowing reads (like `item not in values`) should not block
+// first-use inference. The `append` call after the narrowing should pin
+// the empty list's element type.
+testcase!(
+    test_narrowing_does_not_block_first_use_inference,
+    TestEnv::new().enable_implicit_any_error(),
+    r#"
+from typing import assert_type
+
+values = []
+for item in [1, 1, 2, 2, 3]:
+    if item not in values:
+        values.append(item)
+assert_type(values, list[int])
+    "#,
+);

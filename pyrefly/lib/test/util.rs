@@ -107,6 +107,7 @@ pub struct TestEnv {
     infer_with_first_use: bool,
     site_package_path: Vec<PathBuf>,
     implicitly_defined_attribute_error: bool,
+    explicit_any_error: bool,
     implicit_any_error: bool,
     unannotated_return_error: bool,
     implicit_any_parameter_error: bool,
@@ -115,6 +116,9 @@ pub struct TestEnv {
     open_unpacking_error: bool,
     missing_override_decorator_error: bool,
     not_required_key_access_error: bool,
+    pytorch_efficiency_lint_error: bool,
+    incompatible_comparison_error: bool,
+    string_as_iterable_warning: bool,
     strict_callable_subtyping: bool,
     spec_compliant_overloads: bool,
     default_require_level: Require,
@@ -137,6 +141,7 @@ impl TestEnv {
             infer_with_first_use: true,
             site_package_path: Vec::new(),
             implicitly_defined_attribute_error: false,
+            explicit_any_error: false,
             implicit_any_error: false,
             unannotated_return_error: false,
             implicit_any_parameter_error: false,
@@ -145,6 +150,9 @@ impl TestEnv {
             open_unpacking_error: false,
             missing_override_decorator_error: false,
             not_required_key_access_error: false,
+            pytorch_efficiency_lint_error: false,
+            incompatible_comparison_error: false,
+            string_as_iterable_warning: false,
             strict_callable_subtyping: false,
             spec_compliant_overloads: false,
             default_require_level: Require::Exports,
@@ -244,6 +252,11 @@ impl TestEnv {
         self
     }
 
+    pub fn enable_explicit_any_error(mut self) -> Self {
+        self.explicit_any_error = true;
+        self
+    }
+
     pub fn enable_implicit_any_error(mut self) -> Self {
         self.implicit_any_error = true;
         self
@@ -281,6 +294,21 @@ impl TestEnv {
 
     pub fn enable_not_required_key_access_error(mut self) -> Self {
         self.not_required_key_access_error = true;
+        self
+    }
+
+    pub fn enable_pytorch_efficiency_lint_error(mut self) -> Self {
+        self.pytorch_efficiency_lint_error = true;
+        self
+    }
+
+    pub fn enable_incompatible_comparison_error(mut self) -> Self {
+        self.incompatible_comparison_error = true;
+        self
+    }
+
+    pub fn enable_string_as_iterable_warning(mut self) -> Self {
+        self.string_as_iterable_warning = true;
         self
     }
 
@@ -392,6 +420,9 @@ impl TestEnv {
         if self.implicitly_defined_attribute_error {
             errors.set_error_severity(ErrorKind::ImplicitlyDefinedAttribute, Severity::Error);
         }
+        if self.explicit_any_error {
+            errors.set_error_severity(ErrorKind::ExplicitAny, Severity::Error);
+        }
         if self.implicit_any_error {
             errors.set_error_severity(ErrorKind::ImplicitAny, Severity::Error);
         }
@@ -415,6 +446,15 @@ impl TestEnv {
         }
         if self.not_required_key_access_error {
             errors.set_error_severity(ErrorKind::NotRequiredKeyAccess, Severity::Error);
+        }
+        if self.pytorch_efficiency_lint_error {
+            config.root.pytorch_efficiency_lints = Some(true);
+        }
+        if self.incompatible_comparison_error {
+            errors.set_error_severity(ErrorKind::IncompatibleComparison, Severity::Error);
+        }
+        if self.string_as_iterable_warning {
+            errors.set_error_severity(ErrorKind::StringAsIterable, Severity::Warn);
         }
         config.extra_file_extensions = self.extra_file_extensions.clone();
         let mut sourcedb = MapDatabase::new(config.get_sys_info());

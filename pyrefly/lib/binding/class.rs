@@ -44,6 +44,7 @@ use crate::binding::binding::BindingClassBaseType;
 use crate::binding::binding::BindingClassField;
 use crate::binding::binding::BindingClassMetadata;
 use crate::binding::binding::BindingClassMro;
+use crate::binding::binding::BindingClassSubscriptSymmetry;
 use crate::binding::binding::BindingClassSynthesizedFields;
 use crate::binding::binding::BindingConsistentOverrideCheck;
 use crate::binding::binding::BindingExpect;
@@ -62,6 +63,7 @@ use crate::binding::binding::KeyClassBaseType;
 use crate::binding::binding::KeyClassField;
 use crate::binding::binding::KeyClassMetadata;
 use crate::binding::binding::KeyClassMro;
+use crate::binding::binding::KeyClassSubscriptSymmetry;
 use crate::binding::binding::KeyClassSynthesizedFields;
 use crate::binding::binding::KeyConsistentOverrideCheck;
 use crate::binding::binding::KeyExpect;
@@ -135,6 +137,7 @@ impl<'a> BindingsBuilder<'a> {
             consistent_override_check_idx: self
                 .idx_for_promise(KeyConsistentOverrideCheck(def_index)),
             abstract_class_check_idx: self.idx_for_promise(KeyAbstractClassCheck(def_index)),
+            subscript_symmetry_idx: self.idx_for_promise(KeyClassSubscriptSymmetry(def_index)),
         };
         (class_object, class_indices)
     }
@@ -243,6 +246,7 @@ impl<'a> BindingsBuilder<'a> {
         let body = mem::take(&mut x.body);
         let field_docstrings = self.extract_field_docstrings(&body);
         let pydantic_before_validator_fields = self.extract_field_validator_fields(&body);
+        let capture_init = self.extract_capture_init(&body);
         let decorators =
             self.ensure_and_bind_decorators(mem::take(&mut x.decorator_list), class_object.usage());
 
@@ -548,6 +552,7 @@ impl<'a> BindingsBuilder<'a> {
                 pydantic_before_validator_fields: pydantic_before_validator_fields
                     .into_boxed_slice(),
                 django_field_info: Box::new(django_field_info),
+                capture_init: capture_init.map(|v| v.into_boxed_slice()),
             },
         );
         self.insert_binding_idx(
@@ -556,6 +561,52 @@ impl<'a> BindingsBuilder<'a> {
                 class_idx: class_indices.class_idx,
             },
         );
+        self.insert_binding_idx(
+            class_indices.subscript_symmetry_idx,
+            BindingClassSubscriptSymmetry {
+                class_idx: class_indices.class_idx,
+            },
+        );
+    }
+
+    /// Scan a class body for a `forward` method decorated with
+    /// `@uses_shape_dsl(..., capture_init=[...])` and return the list of `__init__`
+    /// parameter names to capture for shape inference.
+    fn extract_capture_init(&mut self, body: &[Stmt]) -> Option<Vec<Name>> {
+        let forward = body
+            .iter()
+            .filter_map(|stmt| stmt.as_function_def_stmt())
+            .find(|func_def| func_def.name.as_str() == "forward")?;
+
+        forward.decorator_list.iter().find_map(|decorator| {
+            let call = decorator.expression.as_call_expr()?;
+            if self.as_special_export(&call.func) != Some(SpecialExport::UsesShapeDsl) {
+                return None;
+            }
+            let capture_init_kw = call.arguments.keywords.iter().find(|kw| {
+                kw.arg
+                    .as_ref()
+                    .is_some_and(|a| a.as_str() == "capture_init")
+            })?;
+            let list = capture_init_kw.value.as_list_expr()?;
+            let names: Vec<Name> = list
+                .elts
+                .iter()
+                .filter_map(|elt| {
+                    if let Some(s) = elt.as_string_literal_expr() {
+                        Some(Name::new(s.value.to_str()))
+                    } else {
+                        self.error(
+                            elt.range(),
+                            ErrorKind::InvalidArgument,
+                            "`capture_init` entries must be string literals".to_owned(),
+                        );
+                        None
+                    }
+                })
+                .collect();
+            Some(names)
+        })
     }
 
     /// Extracts docstrings for each field, mapping the field's range to the docstring's range.
@@ -996,6 +1047,7 @@ impl<'a> BindingsBuilder<'a> {
                 pydantic_config_dict: PydanticConfigDict::default(),
                 pydantic_before_validator_fields: Box::default(),
                 django_field_info: Box::default(),
+                capture_init: None,
             },
         );
         self.insert_binding_idx(
@@ -1061,6 +1113,12 @@ impl<'a> BindingsBuilder<'a> {
         self.insert_binding_idx(
             class_indices.abstract_class_check_idx,
             BindingAbstractClassCheck {
+                class_idx: class_indices.class_idx,
+            },
+        );
+        self.insert_binding_idx(
+            class_indices.subscript_symmetry_idx,
+            BindingClassSubscriptSymmetry {
                 class_idx: class_indices.class_idx,
             },
         );
