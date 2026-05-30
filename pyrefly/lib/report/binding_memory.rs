@@ -146,7 +146,6 @@ mod tests {
             ClassDefIndex(0),
             Identifier::new("my_class", TextRange::default()),
             NestingContext::toplevel(),
-            SmallMap::new(),
         );
         assert_eq!(
             ReportKey::new(module, &v),
@@ -165,7 +164,9 @@ mod tests {
             decorators: Default::default(),
             is_new_type: false,
             pydantic_config_dict: PydanticConfigDict::default(),
+            pydantic_before_validator_fields: Box::default(),
             django_field_info: Box::default(),
+            capture_init: None,
         };
         assert_eq!(
             ReportKey::new(module, &v),
